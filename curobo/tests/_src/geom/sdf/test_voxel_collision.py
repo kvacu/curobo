@@ -673,6 +673,78 @@ class TestVoxelDataCreation:
         assert params[3].item() == pytest.approx(0.02, abs=1e-5)  # voxel_size
 
 
+# A float32 bound one ULP below count * voxel_size, as a grid saved in float32 comes back:
+# float32(1.1999999) / float32(0.02) = 59.999996. The kernels cast params[:3] to int, so a
+# count recomputed as dims / voxel_size would be 59 and every flattened-grid stride wrong.
+ROUNDOFF_DIMS = (0.5, 0.5, 1.1999999284744263)
+ROUNDOFF_VOXEL = 0.02
+ROUNDOFF_COUNTS = [25.0, 25.0, 60.0]
+
+
+class TestVoxelDataGridCounts:
+    """params[:3] are the grids' integer voxel counts on every path that writes them."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_roundoff_bound_truncates_when_divided(self):
+        quotient = torch.tensor(ROUNDOFF_DIMS, dtype=torch.float32) / torch.tensor(
+            ROUNDOFF_VOXEL, dtype=torch.float32
+        )
+        assert int(quotient[2].item()) == 59
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_create_from_voxel_grids_stores_counts(self, device_cfg):
+        grid = _make_empty_esdf(dims=ROUNDOFF_DIMS, voxel_size=ROUNDOFF_VOXEL)
+        voxel_data = VoxelData.create_from_voxel_grids([grid], device_cfg)
+        assert voxel_data.params[0, 0, :3].cpu().tolist() == ROUNDOFF_COUNTS
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_add_load_batch_and_update_store_counts(self, device_cfg):
+        grid = _make_empty_esdf(dims=ROUNDOFF_DIMS, voxel_size=ROUNDOFF_VOXEL)
+        cache = VoxelData.create_cache(
+            max_n=2,
+            num_envs=1,
+            device_cfg=device_cfg,
+            grid_dims=list(ROUNDOFF_DIMS),
+            voxel_size=ROUNDOFF_VOXEL,
+        )
+        idx = cache.add(grid)
+        assert cache.params[0, idx, :3].cpu().tolist() == ROUNDOFF_COUNTS
+        cache.load_batch([grid], env_idx=0)
+        assert cache.params[0, 0, :3].cpu().tolist() == ROUNDOFF_COUNTS
+        cache.params[0, 0, :3] = 0.0
+        flat = VoxelGrid(  # update_data takes the features flattened, (n, 1)
+            name=grid.name,
+            pose=grid.pose,
+            dims=grid.dims,
+            voxel_size=grid.voxel_size,
+            feature_tensor=grid.feature_tensor.reshape(-1, 1),
+            feature_dtype=torch.float16,
+        )
+        cache.update_data(flat, env_idx=0)
+        assert cache.params[0, 0, :3].cpu().tolist() == ROUNDOFF_COUNTS
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_obstacle_is_read_where_it_is_on_a_roundoff_grid(self, device_cfg):
+        """A box on a roundoff grid is read at its place and nowhere else.
+
+        With a truncated z count every flattened-grid stride shifts and the box moves.
+        """
+        grid = _make_box_esdf(
+            grid_dims=ROUNDOFF_DIMS,
+            voxel_size=ROUNDOFF_VOXEL,
+            box_center=(0.1, -0.05, 0.4),
+            box_half=(0.04, 0.04, 0.04),
+        )
+        voxel_data = VoxelData.create_from_voxel_grids([grid], device_cfg)
+        kwargs = {"dtype": torch.float32, "device": "cuda:0"}
+        inside = torch.tensor([[[[0.1, -0.05, 0.4, 0.01]]]], **kwargs)
+        elsewhere = torch.tensor([[[[0.1, -0.05, -0.4, 0.01]]]], **kwargs)
+        dist_inside, _ = _launch_collision(voxel_data, inside, activation_distance=0.02)
+        dist_elsewhere, _ = _launch_collision(voxel_data, elsewhere, activation_distance=0.02)
+        assert dist_inside.item() > 0.0
+        assert dist_elsewhere.item() == 0.0
+
+
 # ── VoxelDataWarp conversion tests ──
 
 

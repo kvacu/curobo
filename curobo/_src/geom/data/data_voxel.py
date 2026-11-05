@@ -39,6 +39,21 @@ from curobo._src.util.logging import log_and_raise
 # =============================================================================
 
 
+def _grid_counts(voxel_grids: List[VoxelGrid], device_cfg: DeviceCfg) -> torch.Tensor:
+    """Integer voxel counts per axis, ``[len(voxel_grids), 3]``, from each grid's shape.
+
+    The kernels read ``params[:3]`` as voxel counts and cast them to int for the flattened-grid
+    strides. Recomputing them as float32 ``dims / voxel_size`` truncates an axis whose bound is
+    one ULP short (``1.1999999 / 0.01 = 119.99999`` -> 119 for a 120-voxel axis), so every
+    stride after it is wrong. ``VoxelGrid.get_grid_shape`` rounds to the exact count.
+    """
+    return torch.as_tensor(
+        [[float(n) for n in v.get_grid_shape()[0]] for v in voxel_grids],
+        device=device_cfg.device,
+        dtype=device_cfg.dtype,
+    )
+
+
 @dataclass
 class VoxelData:
     """GPU tensor storage for voxel grid (ESDF) obstacles.
@@ -263,7 +278,7 @@ class VoxelData:
         size_t = torch.as_tensor(
             np.array([voxel_grid.voxel_size]), device=device_cfg.device, dtype=device_cfg.dtype
         ).unsqueeze(-1)
-        grid_t = dims_t / size_t
+        grid_t = _grid_counts([voxel_grid], device_cfg)
         params_t = torch.cat([grid_t, size_t], dim=-1)
 
         params[env_idx, 0, :] = params_t[0]
@@ -457,7 +472,7 @@ class VoxelData:
         )
         dimensions = torch.as_tensor(voxel_grid.dims, device=self.dims.device, dtype=self.dims.dtype)
         params = torch.tensor(
-            [dim / voxel_grid.voxel_size for dim in voxel_grid.dims] + [voxel_grid.voxel_size],
+            list(voxel_grid.get_grid_shape()[0]) + [voxel_grid.voxel_size],
             device=self.params.device,
             dtype=self.params.dtype,
         )
@@ -509,12 +524,10 @@ class VoxelData:
         dims_t = torch.as_tensor(
             np.array(dims_batch), device=self.device_cfg.device, dtype=self.device_cfg.dtype
         )
-
-
         size_t = torch.as_tensor(
             np.array(size_batch), device=self.device_cfg.device, dtype=self.device_cfg.dtype
         ).unsqueeze(-1)
-        grid_t = dims_t / size_t
+        grid_t = _grid_counts(voxel_grids, self.device_cfg)
         params_t = torch.cat([grid_t, size_t], dim=-1)
 
         self.params[env_idx, :num_voxels, :] = params_t
@@ -585,7 +598,7 @@ class VoxelData:
         dims_t = torch.as_tensor(
             voxel_grid.dims, device=self.device_cfg.device, dtype=self.device_cfg.dtype
         )
-        grid_t = dims_t / voxel_grid.voxel_size
+        grid_t = _grid_counts([voxel_grid], self.device_cfg)[0]
         self.params[env_idx, idx, :3].copy_(grid_t)
         self.params[env_idx, idx, 3] = voxel_grid.voxel_size
         # dims[:3] stores world dimensions in meters
